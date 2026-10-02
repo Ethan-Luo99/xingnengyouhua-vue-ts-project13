@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import './App.css'
-import type { MainToWorker, WorkerToMain } from './workers/sim.worker'
+import type { MainToWorker, WorkerToMain } from './workers/sim-core'
 
 const COUNT = 1200
 const HUD_INTERVAL_MS = 250
@@ -39,6 +39,36 @@ function bakeSprite(): HTMLCanvasElement {
   return sprite
 }
 
+// MDN 式能力探测：浏览器只有实现了 module worker 才会读取 options.type
+function detectModuleWorker(): boolean {
+  let supported = false
+  try {
+    const tester = {
+      get type() {
+        supported = true
+        return 'module'
+      },
+    }
+    new Worker('blob://', tester as unknown as WorkerOptions).terminate()
+  } catch {
+    // 无效 URL 可能同步抛错，但只要 type getter 被读过即视为支持
+  }
+  return supported
+}
+
+function createSimWorker(): Worker {
+  if (detectModuleWorker()) {
+    try {
+      return new Worker(new URL('./workers/sim.worker.ts', import.meta.url), {
+        type: 'module',
+      })
+    } catch {
+      // 构造期失败（如旧 Safari）落到 classic 入口
+    }
+  }
+  return new Worker(new URL('./workers/sim.classic.worker.ts', import.meta.url))
+}
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const hudRef = useRef<HTMLDivElement>(null)
@@ -49,10 +79,7 @@ function App() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const worker = new Worker(
-      new URL('./workers/sim.worker.ts', import.meta.url),
-      { type: 'module' },
-    )
+    const worker = createSimWorker()
 
     let latest: Float32Array<ArrayBuffer> | null = null
     let inFlight = false
@@ -61,6 +88,8 @@ function App() {
     let lastT = -1
     let cssWidth = 0
     let cssHeight = 0
+    let hidden = document.hidden
+    let inViewport = true
 
     // 位图尺寸唯一写入源：仅此处允许改 canvas.width/height
     const applySize = () => {
@@ -79,6 +108,19 @@ function App() {
     applySize()
     const ro = new ResizeObserver(applySize)
     ro.observe(canvas)
+
+    // 标签页隐藏或画布滚出视口时暂停仿真请求；恢复时重置时间基准，
+    // 配合 MAX_DT_MS 钳制防止追帧跳变
+    const onVisibility = () => {
+      hidden = document.hidden
+      if (!hidden) lastT = -1
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    const io = new IntersectionObserver((entries) => {
+      inViewport = entries[0]?.isIntersecting ?? true
+      if (inViewport) lastT = -1
+    })
+    io.observe(canvas)
 
     const sprite = bakeSprite()
 
@@ -123,8 +165,9 @@ function App() {
         hudRef.current.textContent = `fps ${Math.round(fps)} / ${fps > 0 ? (1000 / fps).toFixed(1) : '-'}ms / particles ${COUNT}`
       }
 
-      // 拉模式背压：上一拍未回来就不发新请求，主线程卡顿时仿真自动降速
-      if (!inFlight) {
+      // 拉模式背压：上一拍未回来就不发新请求，主线程卡顿时仿真自动降速；
+      // 隐藏或滚出视口时暂停请求，Worker 自然空转
+      if (!inFlight && !hidden && inViewport) {
         inFlight = true
         simTime += dt
         send({ type: 'tick', tick: simTime })
@@ -149,6 +192,8 @@ function App() {
     return () => {
       cancelAnimationFrame(rafId)
       ro.disconnect()
+      io.disconnect()
+      document.removeEventListener('visibilitychange', onVisibility)
       worker.onmessage = null
       worker.terminate()
     }
