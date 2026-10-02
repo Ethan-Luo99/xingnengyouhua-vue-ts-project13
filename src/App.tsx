@@ -1,32 +1,47 @@
 import { useEffect, useRef } from 'react'
 import './App.css'
+import type { MainToWorker, WorkerToMain } from './workers/sim.worker'
 
 const COUNT = 1200
-const CORE_COLOR = 'rgba(255,255,255,0.6)'
 const HUD_INTERVAL_MS = 250
+const MAX_DT_MS = 100
+const MAX_DPR = 2
+// sprite 位图 96px，按 48 CSS px 绘制（DPR 2 下仍清晰）；
+// 视觉对应原实现：白色径向渐变核心 r=12 + shadowBlur=18 的 #639 辉光
+const SPRITE_PX = 96
+const DRAW_SIZE = 48
+const DRAW_HALF = DRAW_SIZE / 2
+
+function bakeSprite(): HTMLCanvasElement {
+  const sprite = document.createElement('canvas')
+  sprite.width = SPRITE_PX
+  sprite.height = SPRITE_PX
+  const s = sprite.getContext('2d')
+  if (!s) return sprite
+  const c = SPRITE_PX / 2
+  const scale = SPRITE_PX / DRAW_SIZE
+
+  const glow = s.createRadialGradient(c, c, 0, c, c, c)
+  glow.addColorStop(0, 'rgba(102,51,153,0.55)')
+  glow.addColorStop(0.45, 'rgba(102,51,153,0.22)')
+  glow.addColorStop(1, 'rgba(102,51,153,0)')
+  s.fillStyle = glow
+  s.fillRect(0, 0, SPRITE_PX, SPRITE_PX)
+
+  const coreRadius = 12 * scale
+  const core = s.createRadialGradient(c, c, 0, c, c, coreRadius)
+  core.addColorStop(0, 'rgba(255,255,255,0.6)')
+  core.addColorStop(1, 'rgba(0,0,0,0)')
+  s.fillStyle = core
+  s.beginPath()
+  s.arc(c, c, coreRadius, 0, Math.PI * 2)
+  s.fill()
+  return sprite
+}
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const hudRef = useRef<HTMLDivElement>(null)
-  const latestRef = useRef<Float32Array | null>(null)
-
-  useEffect(() => {
-    const worker = new Worker(
-      new URL('./workers/sim.worker.ts', import.meta.url),
-      { type: 'module' },
-    )
-    worker.onmessage = (e: MessageEvent<Float32Array>) => {
-      latestRef.current = e.data
-    }
-    const timer = setInterval(() => {
-      worker.postMessage({ tick: Date.now(), count: COUNT })
-    }, 16)
-    return () => {
-      clearInterval(timer)
-      worker.onmessage = null
-      worker.terminate()
-    }
-  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -34,10 +49,53 @@ function App() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    canvas.width = canvas.clientWidth
-    canvas.height = canvas.clientHeight
+    const worker = new Worker(
+      new URL('./workers/sim.worker.ts', import.meta.url),
+      { type: 'module' },
+    )
 
+    let latest: Float32Array<ArrayBuffer> | null = null
+    let inFlight = false
     let rafId = 0
+    let simTime = 0
+    let lastT = -1
+    let cssWidth = 0
+    let cssHeight = 0
+
+    // 位图尺寸唯一写入源：仅此处允许改 canvas.width/height
+    const applySize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR)
+      cssWidth = canvas.clientWidth
+      cssHeight = canvas.clientHeight
+      const w = Math.max(1, Math.round(cssWidth * dpr))
+      const h = Math.max(1, Math.round(cssHeight * dpr))
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w
+        canvas.height = h
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    }
+    // 同步初始化，避免 ResizeObserver 首回调与首帧绘制的竞态
+    applySize()
+    const ro = new ResizeObserver(applySize)
+    ro.observe(canvas)
+
+    const sprite = bakeSprite()
+
+    const send = (msg: MainToWorker, transfer?: Transferable[]) => {
+      worker.postMessage(msg, transfer ? { transfer } : undefined)
+    }
+
+    send({ type: 'init', count: COUNT })
+    worker.onmessage = (e: MessageEvent<WorkerToMain>) => {
+      const msg = e.data
+      if (msg.type !== 'frame') return
+      inFlight = false
+      // 旧快照所有权归还 Worker 复用，稳态零分配
+      if (latest) send({ type: 'recycle', buffer: latest.buffer }, [latest.buffer])
+      latest = msg.view
+    }
+
     let frames = 0
     let windowStart = -1
     let lastHud = 0
@@ -45,6 +103,9 @@ function App() {
 
     const loop = (t: number) => {
       rafId = requestAnimationFrame(loop)
+
+      const dt = lastT < 0 ? 0 : Math.min(t - lastT, MAX_DT_MS)
+      lastT = t
 
       if (windowStart < 0) {
         windowStart = t
@@ -62,39 +123,35 @@ function App() {
         hudRef.current.textContent = `fps ${Math.round(fps)} / ${fps > 0 ? (1000 / fps).toFixed(1) : '-'}ms / particles ${COUNT}`
       }
 
-      const data = latestRef.current
-      if (!data) return
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-      for (let i = 0; i < COUNT; i++) {
-        const x = data[i * 4]
-        const y = data[i * 4 + 1]
-        const grad = ctx.createRadialGradient(x, y, 0, x, y, 12)
-        grad.addColorStop(0, CORE_COLOR)
-        grad.addColorStop(1, 'rgba(0,0,0,0)')
-        ctx.save()
-        ctx.shadowBlur = 18
-        ctx.shadowColor = '#639'
-        ctx.fillStyle = grad
-        ctx.beginPath()
-        ctx.arc(x, y, 6, 0, Math.PI * 2)
-        ctx.fill()
-        ctx.restore()
+      // 拉模式背压：上一拍未回来就不发新请求，主线程卡顿时仿真自动降速
+      if (!inFlight) {
+        inFlight = true
+        simTime += dt
+        send({ type: 'tick', tick: simTime })
       }
+
+      if (!latest) return
+      ctx.clearRect(0, 0, cssWidth, cssHeight)
+      ctx.globalCompositeOperation = 'lighter'
+      for (let i = 0; i < COUNT; i++) {
+        ctx.drawImage(
+          sprite,
+          latest[i * 4] - DRAW_HALF,
+          latest[i * 4 + 1] - DRAW_HALF,
+          DRAW_SIZE,
+          DRAW_SIZE,
+        )
+      }
+      ctx.globalCompositeOperation = 'source-over'
     }
     rafId = requestAnimationFrame(loop)
-    return () => cancelAnimationFrame(rafId)
-  }, [])
 
-  useEffect(() => {
-    const onResize = () => {
-      const c = canvasRef.current
-      if (!c) return
-      c.width = c.clientWidth
-      c.height = c.clientHeight
+    return () => {
+      cancelAnimationFrame(rafId)
+      ro.disconnect()
+      worker.onmessage = null
+      worker.terminate()
     }
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
   }, [])
 
   return (
