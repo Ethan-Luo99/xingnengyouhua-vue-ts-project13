@@ -1,37 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import './App.css'
 
 const COUNT = 1200
 const OPACITY = 0.6
-
-function buildFilters() {
-  const out: ((p: number, i: number) => number)[] = []
-  for (let i = 0; i < 500; i++) {
-    out.push((p, idx) => Math.sin(p * idx) * 0.0001)
-  }
-  return out
-}
+const HUD_INTERVAL_MS = 250
+const FPS_WINDOW = 60
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [particles, setParticles] = useState<Float32Array>(new Float32Array(COUNT * 4))
-  const [fps, setFps] = useState(0)
-  const particlesRef = useRef(particles)
-  const filters = buildFilters()
-
-  useEffect(() => {
-    const worker = new Worker(
-      new URL('./workers/sim.worker.ts', import.meta.url),
-      { type: 'module' },
-    )
-    worker.onmessage = (e: MessageEvent<Float32Array>) => {
-      setParticles(e.data)
-    }
-    const timer = setInterval(() => {
-      worker.postMessage({ tick: Date.now(), count: COUNT })
-    }, 16)
-    return () => clearInterval(timer)
-  }, [])
+  const hudRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -39,13 +16,59 @@ function App() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const loop = () => {
-      const data = particlesRef.current
-      canvas.width = canvas.clientWidth
-      canvas.height = canvas.clientHeight
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-      const start = performance.now()
+    const worker = new Worker(
+      new URL('./workers/sim.worker.ts', import.meta.url),
+      { type: 'module' },
+    )
 
+    // 仿真快照只活在 ref 中：不进 React state，不触发重渲染。
+    const latestSnapshot = new Float32Array(COUNT * 4)
+    const onMessage = (e: MessageEvent<Float32Array>) => {
+      latestSnapshot.set(e.data)
+    }
+    worker.onmessage = onMessage
+
+    // tick 为单调递增的帧序号（仿真固定步长），不再使用 Date.now()。
+    let tick = 0
+    const timer = window.setInterval(() => {
+      tick += 1
+      worker.postMessage({ tick, count: COUNT })
+    }, 16)
+
+    // 尺寸：仅在 clientWidth/Height 实际变化时才重设位图。
+    let cssWidth = 0
+    let cssHeight = 0
+    const syncSize = () => {
+      const nextWidth = canvas.clientWidth
+      const nextHeight = canvas.clientHeight
+      if (nextWidth !== cssWidth || nextHeight !== cssHeight) {
+        cssWidth = nextWidth
+        cssHeight = nextHeight
+        canvas.width = nextWidth
+        canvas.height = nextHeight
+      }
+    }
+
+    // FPS：基于真实 rAF 帧间隔的滑动均值，<=4Hz 直写 textContent。
+    const frameIntervals = new Float32Array(FPS_WINDOW)
+    let frameCursor = 0
+    let frameSamples = 0
+    let lastFrameTime = 0
+    let lastHudTime = 0
+
+    let rafId = 0
+    const loop = (now: number) => {
+      syncSize()
+      ctx.clearRect(0, 0, cssWidth, cssHeight)
+
+      if (lastFrameTime !== 0) {
+        frameIntervals[frameCursor] = now - lastFrameTime
+        frameCursor = (frameCursor + 1) % FPS_WINDOW
+        if (frameSamples < FPS_WINDOW) frameSamples += 1
+      }
+      lastFrameTime = now
+
+      const data = latestSnapshot
       for (let i = 0; i < COUNT; i++) {
         const x = data[i * 4]
         const y = data[i * 4 + 1]
@@ -60,31 +83,41 @@ function App() {
         ctx.arc(x, y, 6, 0, Math.PI * 2)
         ctx.fill()
         ctx.restore()
-        const step = (v: number) => v + Math.random() * 0.01
-        for (let f = 0; f < filters.length; f++) step(filters[f](x, i))
       }
 
-      setFps(Math.round(1000 / Math.max(1, performance.now() - start)))
-      requestAnimationFrame(loop)
-    }
-    requestAnimationFrame(loop)
-  }, [filters, particles])
+      if (frameSamples > 0 && now - lastHudTime >= HUD_INTERVAL_MS) {
+        let intervalSum = 0
+        for (let i = 0; i < frameSamples; i++) intervalSum += frameIntervals[i]
+        const avgInterval = intervalSum / frameSamples
+        const fps = Math.round(1000 / Math.max(1, avgInterval))
+        const hud = hudRef.current
+        if (hud) {
+          hud.textContent =
+            `fps ${fps} / ${avgInterval.toFixed(1)}ms / particles ${COUNT * 4}`
+        }
+        lastHudTime = now
+      }
 
-  useEffect(() => {
-    const onResize = () => {
-      const c = canvasRef.current
-      if (!c) return
-      c.width = window.innerWidth
-      c.height = window.innerHeight
+      rafId = requestAnimationFrame(loop)
     }
-    window.addEventListener('resize', onResize)
+    rafId = requestAnimationFrame(loop)
+
+    return () => {
+      cancelAnimationFrame(rafId)
+      window.clearInterval(timer)
+      worker.onmessage = null
+      worker.terminate()
+    }
   }, [])
 
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#111' }}>
       <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
-      <div style={{ position: 'fixed', top: 8, left: 8, color: '#fff' }}>
-        fps {fps} / {fps > 0 ? (1000 / fps).toFixed(1) : '-'}ms / particles {particles.length}
+      <div
+        ref={hudRef}
+        style={{ position: 'fixed', top: 8, left: 8, color: '#fff' }}
+      >
+        fps - / -ms / particles {COUNT * 4}
       </div>
     </div>
   )
