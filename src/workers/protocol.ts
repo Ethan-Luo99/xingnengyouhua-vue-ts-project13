@@ -9,8 +9,14 @@ export type SimTickRequest = {
   recycle?: Float32Array<ArrayBuffer>
 }
 
+export type SimReadyMessage = {
+  type: 'ready'
+}
+
 export type SimStateMessage = {
   type: 'state'
   seq: number
   particles: Float32Array<ArrayBuffer>
 }
+
+export type SimWorkerMessage = SimReadyMessage | SimStateMessage
